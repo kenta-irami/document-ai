@@ -1,0 +1,533 @@
+// ▼▼▼▼▼ ここから設定項目 ▼▼▼▼▼
+
+// 1. Google CloudプロジェクトのプロジェクトID
+const GCP_PROJECT_ID = 'news-jockey-project';
+
+// 2. プロセッサを作成したリージョン (例: 'us' または 'eu')
+const LOCATION = 'us';
+
+// 3. Document AIで作成した発注書プロセッサのID
+const PROCESSOR_ID = 'e4866b2cfbe0c83f';
+
+// 4. 発注書ファイルが保存されているGoogle DriveフォルダのID
+const UNPROCESSED_FOLDER_ID = '1g26AeR7CJpPnXwe375ldG7wJoSjwyiHO';
+
+// 5. (任意) 処理済みファイルを移動させる先のフォルダID
+const PROCESSED_FOLDER_ID = '1g_PFDE3TR9wdRQcJz4v5bjKwuxMLSx_X';
+
+// 6. 【重要】デプロイしたプロセッサのバージョンID
+const PROCESSOR_VERSION_ID = '410be6589c313195';
+
+// ▲▲▲▲▲ ここまで設定項目 ▲▲▲▲▲
+
+/**
+ * メインの処理関数：指定フォルダ内のファイルを処理します。
+ */
+function processPurchaseOrders() {
+  Logger.log("=== 発注書処理開始 ===");
+  
+  const unprocessedFolder = DriveApp.getFolderById(UNPROCESSED_FOLDER_ID);
+  const processedFolder = DriveApp.getFolderById(PROCESSED_FOLDER_ID);
+  
+  const files = unprocessedFolder.getFiles();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  
+  // 既存のヘッダーを確認（ヘッダーは手動で設定済みと想定）
+  const lastRow = sheet.getLastRow();
+  Logger.log(`現在のスプレッドシート行数: ${lastRow}`);
+  
+  // 既存のヘッダー: 出荷日予定、会社名、配送先、先方記載ID、JANコード下４桁、数量、明細桁番号、入力担当者
+
+  let processedCount = 0;
+  let totalRowsAdded = 0;
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const mimeType = file.getMimeType();
+
+    if (mimeType !== MimeType.PDF && mimeType !== MimeType.JPEG && mimeType !== MimeType.PNG) {
+      Logger.log(`Skipping non-supported file: ${file.getName()} (${mimeType})`);
+      continue;
+    }
+
+    Logger.log(`\n=== 処理中: ${file.getName()} ===`);
+
+    try {
+      const doc = callDocumentAI(file);
+      if (doc) {
+        const commonData = extractCommonData(doc);
+        const lineItems = extractLineItems(doc);
+
+        Logger.log(`共通データ: ${JSON.stringify(commonData)}`);
+        Logger.log(`抽出された品目数: ${lineItems.length}`);
+
+        if (lineItems.length > 0) {
+          let validRowsAdded = 0;
+          
+          lineItems.forEach((item, index) => {
+            // 有効なデータのみを処理（数量またはJANコードがある場合）
+            if ((item.quantity && item.quantity !== '0') || item.jan_code_last4) {
+              const itemCommonData = getCommonDataForLineItem(doc, index);
+              
+              const rowData = [
+                itemCommonData.shipping_date || commonData.shipping_date || '',        // 出荷日予定
+                itemCommonData.company_name || commonData.company_name || '',          // 会社名
+                itemCommonData.delivery_address || commonData.delivery_address || '', // 配送先
+                itemCommonData.customer_reference_id || commonData.customer_reference_id || '', // 先方記載ID
+                item.jan_code_last4 ? "'" + item.jan_code_last4 : '',                // JANコード下４桁（文字列として明示）
+                item.quantity || '',                                                  // 数量
+                item.line_number || '',                                               // 明細桁番号
+                itemCommonData.data_entry_person || commonData.data_entry_person || '' // 入力担当者
+              ];
+              
+              sheet.appendRow(rowData);
+              validRowsAdded++;
+              totalRowsAdded++;
+              
+              Logger.log(`行追加: Line=${item.line_number}, Qty=${item.quantity}, JAN=${item.jan_code_last4}`);
+            }
+          });
+          
+          Logger.log(`有効な行を${validRowsAdded}行追加しました`);
+        } else {
+          Logger.log(`品目が抽出されませんでした: ${file.getName()}`);
+          
+          // 品目が抽出されない場合でも基本情報だけは記録
+          if (Object.keys(commonData).length > 0) {
+            const rowData = [
+              commonData.shipping_date || '',        // 出荷日予定
+              commonData.company_name || '',          // 会社名
+              commonData.delivery_address || '',     // 配送先
+              commonData.customer_reference_id || '', // 先方記載ID
+              '',                                     // JANコード下４桁
+              '',                                     // 数量
+              '1',                                    // 明細桁番号
+              commonData.data_entry_person || ''      // 入力担当者
+            ];
+            sheet.appendRow(rowData);
+            totalRowsAdded++;
+            Logger.log("基本情報のみを記録しました");
+          }
+        }
+        
+        file.moveTo(processedFolder);
+        processedCount++;
+        Logger.log(`Successfully processed and moved file: ${file.getName()}`);
+      } else {
+        Logger.log(`Failed to process file: ${file.getName()} - Document AI returned null`);
+      }
+    } catch (e) {
+      Logger.log(`Error processing file ${file.getName()}: ${e.toString()}`);
+      Logger.log(`Stack trace: ${e.stack}`);
+    }
+  }
+  
+  SpreadsheetApp.flush();
+  Logger.log(`\n=== 処理完了 ===`);
+  Logger.log(`処理ファイル数: ${processedCount}`);
+  Logger.log(`追加行数: ${totalRowsAdded}`);
+}
+
+/**
+ * Document AI APIを呼び出し、documentオブジェクトを返す
+ */
+function callDocumentAI(file) {
+  const endpoint = `https://${LOCATION}-documentai.googleapis.com/v1/projects/${GCP_PROJECT_ID}/locations/${LOCATION}/processors/${PROCESSOR_ID}/processorVersions/${PROCESSOR_VERSION_ID}:process`;
+  const requestBody = {
+    "skipHumanReview": true,
+    "rawDocument": {
+      "content": Utilities.base64Encode(file.getBlob().getBytes()),
+      "mimeType": file.getMimeType()
+    }
+  };
+  const options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'headers': { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() },
+    'payload': JSON.stringify(requestBody),
+    'muteHttpExceptions': true
+  };
+  const response = UrlFetchApp.fetch(endpoint, options);
+  const responseCode = response.getResponseCode();
+  const responseBody = response.getContentText();
+
+  if (responseCode === 200) {
+    Logger.log("Document AI API call successful.");
+    return JSON.parse(responseBody).document;
+  }
+  Logger.log(`API Error [${responseCode}]: ${responseBody}`);
+  return null;
+}
+
+/**
+ * Documentオブジェクトから基本情報を抽出する（汎用版）
+ */
+function extractCommonData(doc) {
+  if (!doc || !doc.entities) return {};
+  
+  const data = {};
+  const entityCounts = {};
+  
+  // エンティティタイプ別に収集
+  doc.entities.forEach(entity => {
+    if (entity.type !== 'line_item' && entity.mentionText) {
+      const type = entity.type;
+      const value = entity.mentionText.replace(/\n/g, ' ').trim();
+      
+      if (!entityCounts[type]) {
+        entityCounts[type] = [];
+      }
+      entityCounts[type].push(value);
+    }
+  });
+  
+  // 各タイプから最適な値を選択
+  for (const [type, values] of Object.entries(entityCounts)) {
+    if (values.length > 0) {
+      if (type === 'company_name') {
+        // JIMOS以外の会社名を優先
+        const nonJimosCompany = values.find(name => !name.includes('JIMOS') && !name.includes('ジモス'));
+        data[type] = nonJimosCompany || values[0];
+      } else if (type === 'shipping_date') {
+        // 最初に見つかった日付を正規化
+        data[type] = normalizeDate(values[0]);
+      } else {
+        // 最初の値を使用
+        data[type] = values[0];
+      }
+    }
+  }
+  
+  return data;
+}
+
+/**
+ * 日付文字列をYYYY/MM/DD形式に正規化（汎用版）
+ */
+function normalizeDate(dateStr) {
+  if (!dateStr) return '';
+  
+  // 日本語形式: 2025年5月14日
+  const jpDate = dateStr.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+  if (jpDate) return `${jpDate[1]}/${jpDate[2].padStart(2, '0')}/${jpDate[3].padStart(2, '0')}`;
+  
+  // スラッシュ区切り: 2025/5/14 または 2025/05/14
+  const slashDate = dateStr.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (slashDate) return `${slashDate[1]}/${slashDate[2].padStart(2, '0')}/${slashDate[3].padStart(2, '0')}`;
+  
+  // 短縮年形式: 25/5/14
+  const shortDate = dateStr.match(/(\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (shortDate) {
+    const year = `20${shortDate[1]}`;
+    return `${year}/${shortDate[2].padStart(2, '0')}/${shortDate[3].padStart(2, '0')}`;
+  }
+  
+  // ドット区切り: 2025.5.14
+  const dotDate = dateStr.match(/(\d{4})\.(\d{1,2})\.(\d{1,2})/);
+  if (dotDate) return `${dotDate[1]}/${dotDate[2].padStart(2, '0')}/${dotDate[3].padStart(2, '0')}`;
+  
+  return dateStr;
+}
+
+/**
+ * 特定のline_itemに対応する基本情報を取得する
+ */
+function getCommonDataForLineItem(doc, lineItemIndex) {
+  if (!doc || !doc.entities) return {};
+  
+  const data = {};
+  const entityGroups = { 
+    shipping_date: [], 
+    company_name: [], 
+    delivery_address: [], 
+    customer_reference_id: [], 
+    data_entry_person: [] 
+  };
+  
+  doc.entities.forEach(entity => { 
+    if (entityGroups[entity.type] && entity.mentionText) {
+      entityGroups[entity.type].push(entity.mentionText.replace(/\n/g, ' ').trim()); 
+    }
+  });
+  
+  for (const [key, values] of Object.entries(entityGroups)) {
+    if (values.length > 0) {
+      if (key === 'company_name') {
+        const issuerCompany = values.find(name => !name.includes('JIMOS') && !name.includes('ジモス'));
+        data[key] = issuerCompany || values[0];
+      } else {
+        const value = values[Math.min(lineItemIndex, values.length - 1)];
+        data[key] = key === 'shipping_date' ? normalizeDate(value) : value;
+      }
+    }
+  }
+  
+  return data;
+}
+
+/**
+ * 品目情報を抽出する（汎用版 - OCRテキスト優先）
+ */
+function extractLineItems(doc) {
+  if (!doc || !doc.entities) {
+    Logger.log("No document or entities found, returning empty array.");
+    return [];
+  }
+
+  // 戦略3: OCRテキストから直接抽出（最優先 - 最も正確）
+  const strategy3Result = extractFromOCRText(doc);
+  if (strategy3Result.length > 0) {
+    Logger.log(`戦略3成功: ${strategy3Result.length}個の品目を抽出（OCRテキスト優先）`);
+    return strategy3Result;
+  }
+
+  // 戦略1: line_itemエンティティとフラットエンティティの組み合わせ
+  const strategy1Result = extractFromLineItemEntities(doc);
+  if (strategy1Result.length > 0) {
+    Logger.log(`戦略1成功: ${strategy1Result.length}個の品目を抽出`);
+    return strategy1Result;
+  }
+
+  // 戦略2: フラットエンティティのみから抽出
+  const strategy2Result = extractFromFlatEntities(doc);
+  if (strategy2Result.length > 0) {
+    Logger.log(`戦略2成功: ${strategy2Result.length}個の品目を抽出`);
+    return strategy2Result;
+  }
+
+  Logger.log("全ての抽出戦略が失敗しました");
+  return [];
+}
+
+/**
+ * 戦略1: line_itemエンティティとフラットエンティティの組み合わせ
+ */
+function extractFromLineItemEntities(doc) {
+  const lineItemEntities = doc.entities.filter(e => e.type === 'line_item');
+  const janCodeEntities = doc.entities.filter(e => 
+    e.type === 'jan_code_last4' || e.type === 'jan_code_13digit' || e.type === 'product_code' || e.type === 'jan_code'
+  );
+
+  if (lineItemEntities.length === 0) return [];
+
+  const items = [];
+  const quantities = [];
+  
+  // line_itemから数量を抽出
+  lineItemEntities.forEach((lineItem, index) => {
+    let quantity = '';
+    if (lineItem.properties && lineItem.properties.length > 0) {
+      for (const prop of lineItem.properties) {
+        if (prop.type === 'quantity' && prop.mentionText) {
+          quantity = prop.mentionText.replace(/[^\d]/g, '');
+          break;
+        }
+      }
+    }
+    quantities.push(quantity);
+  });
+
+  // JANコードを抽出
+  const janCodes = janCodeEntities.map(entity => 
+    entity.mentionText ? entity.mentionText.replace(/[^\d]/g, '') : ''
+  ).filter(code => code.length > 0);
+
+  // 組み合わせてアイテムを構築
+  const maxItems = Math.max(quantities.length, janCodes.length);
+  for (let i = 0; i < maxItems; i++) {
+    const quantity = quantities[i] || '';
+    const janCode = janCodes[i] || '';
+    
+    if ((quantity && quantity !== '0') || janCode) {
+      items.push({
+        line_number: (i + 1).toString(),
+        quantity: quantity,
+        jan_code_last4: janCode ? janCode.slice(-4) : ''
+      });
+    }
+  }
+
+  return items;
+}
+
+/**
+ * 戦略2: フラットエンティティのみから抽出
+ */
+function extractFromFlatEntities(doc) {
+  const quantityEntities = doc.entities.filter(e => e.type === 'quantity');
+  const janCodeEntities = doc.entities.filter(e => 
+    e.type === 'jan_code_last4' || e.type === 'jan_code_13digit' || e.type === 'product_code' || e.type === 'jan_code'
+  );
+  const lineNumberEntities = doc.entities.filter(e => e.type === 'line_number');
+
+  if (quantityEntities.length === 0 && janCodeEntities.length === 0) return [];
+
+  const items = [];
+  const maxItems = Math.max(quantityEntities.length, janCodeEntities.length);
+
+  for (let i = 0; i < maxItems; i++) {
+    const qtyEntity = quantityEntities[i];
+    const janEntity = janCodeEntities[i];
+    const lineEntity = lineNumberEntities[i];
+
+    const quantity = qtyEntity && qtyEntity.mentionText ? qtyEntity.mentionText.replace(/[^\d]/g, '') : '';
+    const janCode = janEntity && janEntity.mentionText ? janEntity.mentionText.replace(/[^\d]/g, '') : '';
+    const lineNumber = lineEntity && lineEntity.mentionText ? lineEntity.mentionText : (i + 1).toString();
+
+    if ((quantity && quantity !== '0') || janCode) {
+      items.push({
+        line_number: lineNumber,
+        quantity: quantity,
+        jan_code_last4: janCode ? janCode.slice(-4) : ''
+      });
+    }
+  }
+
+  return items;
+}
+
+/**
+ * 戦略3: OCRテキストから直接抽出（シンプル版 - OCRそのまま表示）
+ */
+function extractFromOCRText(doc) {
+  if (!doc.text) return [];
+
+  const items = [];
+  const lines = doc.text.split('\n');
+  
+  Logger.log("=== OCRテキスト全体 ===");
+  Logger.log(doc.text);
+  Logger.log("===================");
+  
+  // 13桁のJANコードを全て抽出
+  const janCodes = [];
+  const allText = doc.text;
+  const janMatches = allText.match(/4\d{12}/g);
+  if (janMatches) {
+    janCodes.push(...janMatches);
+  }
+  
+  Logger.log(`検出されたJANコード: ${janCodes.length}個`);
+  janCodes.forEach((jan, index) => {
+    Logger.log(`JAN ${index + 1}: ${jan} (末尾4桁: ${jan.slice(-4)})`);
+  });
+  
+  // OCRテキストから数字を全て抽出（価格や日付ではない小さな数字）
+  const allNumbers = [];
+  lines.forEach((line, lineIndex) => {
+    // 1-2桁の数字を検索（価格ではない小さな数字）
+    const numberMatches = line.match(/\b([1-9]\d?)\b/g);
+    if (numberMatches) {
+      numberMatches.forEach(num => {
+        const number = parseInt(num);
+        if (number >= 1 && number <= 99) { // 1-99の範囲
+          allNumbers.push(num);
+          Logger.log(`行 ${lineIndex + 1}: 検出された数字 "${num}" in "${line.trim()}"`);
+        }
+      });
+    }
+  });
+  
+  Logger.log(`検出された数量候補: ${allNumbers.length}個 [${allNumbers.join(', ')}]`);
+  
+  // JANコードと数量を組み合わせ（シンプルに順番通り）
+  const maxItems = Math.max(janCodes.length, allNumbers.length);
+  
+  for (let i = 0; i < janCodes.length; i++) {
+    const janCode = janCodes[i];
+    const quantity = allNumbers[i] || ''; // 対応する数量、なければ空
+    
+    items.push({
+      line_number: (i + 1).toString(),
+      quantity: quantity,
+      jan_code_last4: janCode.slice(-4)
+    });
+    
+    Logger.log(`アイテム ${i + 1}: JAN=${janCode.slice(-4)}, 数量="${quantity}"`);
+  }
+  
+  Logger.log(`最終抽出結果: ${items.length}個のアイテム`);
+  return items;
+}
+
+/**
+ * プロセッサの設定確認用のテスト関数（修正版）
+ */
+function testProcessorConfig() {
+  Logger.log("=== プロセッサ設定テスト（修正版） ===");
+  const unprocessedFolder = DriveApp.getFolderById(UNPROCESSED_FOLDER_ID);
+  const files = unprocessedFolder.getFiles();
+  
+  if (files.hasNext()) {
+    const testFile = files.next();
+    Logger.log(`テストファイル: ${testFile.getName()}`);
+    
+    const doc = callDocumentAI(testFile);
+    if (doc && doc.entities) {
+      Logger.log("=== APIレスポンス構造分析 ===");
+      Logger.log(`Total entities found: ${doc.entities.length}`);
+      
+      // エンティティタイプ別の統計
+      const entityStats = {};
+      doc.entities.forEach(entity => {
+        entityStats[entity.type] = (entityStats[entity.type] || 0) + 1;
+      });
+      
+      Logger.log("=== エンティティタイプ別統計 ===");
+      Object.entries(entityStats).forEach(([type, count]) => {
+        Logger.log(`${type}: ${count}個`);
+      });
+      
+      // OCRテキストの詳細分析
+      Logger.log("=== OCRテキスト分析（JAN抽出用） ===");
+      if (doc.text) {
+        const text = doc.text;
+        const janCodes = text.match(/4\d{12}/g) || [];
+        Logger.log(`OCRテキストから13桁JANコード検出: ${janCodes.length}個`);
+        janCodes.slice(0, 5).forEach((jan, index) => {
+          Logger.log(`  JAN ${index + 1}: ${jan} (末尾4桁: ${jan.slice(-4)})`);
+        });
+      }
+      
+      // 全戦略での抽出テスト
+      Logger.log("=== 抽出戦略テスト ===");
+      const strategy1 = extractFromLineItemEntities(doc);
+      const strategy2 = extractFromFlatEntities(doc);
+      const strategy3 = extractFromOCRText(doc);
+      
+      Logger.log(`戦略1（line_item+フラット）: ${strategy1.length}個`);
+      Logger.log(`戦略2（フラットのみ）: ${strategy2.length}個`);
+      Logger.log(`戦略3（OCRテキスト）: ${strategy3.length}個`);
+      
+      // 最終結果
+      const finalResult = extractLineItems(doc);
+      Logger.log(`=== 最終抽出結果: ${finalResult.length}個 ===`);
+      finalResult.slice(0, 5).forEach((item, index) => {
+        Logger.log(`Item ${index + 1}: Line=${item.line_number}, Qty=${item.quantity}, JAN=${item.jan_code_last4}`);
+      });
+      
+      // 基本情報の抽出テスト
+      Logger.log("=== 基本情報抽出テスト ===");
+      const commonData = extractCommonData(doc);
+      Object.entries(commonData).forEach(([key, value]) => {
+        Logger.log(`  ${key}: "${value}"`);
+      });
+      
+    } else {
+      Logger.log("No entities found or document is null.");
+    }
+  } else {
+    Logger.log("テスト用ファイルが見つかりません");
+  }
+}
+
+/**
+ * スプレッドシートにカスタムメニューを追加
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+      .createMenu('Document AI 連携')
+      .addItem('未処理の発注書を処理', 'processPurchaseOrders')
+      .addItem('プロセッサ設定テスト', 'testProcessorConfig')
+      .addToUi();
+}
