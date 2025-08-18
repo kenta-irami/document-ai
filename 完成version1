@@ -1,0 +1,500 @@
+// ▼▼▼▼▼ 設定項目 ▼▼▼▼▼
+const GCP_PROJECT_ID = 'news-jockey-project';
+const LOCATION = 'us';
+const PROCESSOR_ID = '9c8a30729fa40994';
+const PROCESSOR_VERSION_ID = '796cb1b934401f5e';
+const UNPROCESSED_FOLDER_ID = '1g26AeR7CJpPnXwe375ldG7wJoSjwyiHO';
+const PROCESSED_FOLDER_ID = '1g_PFDE3TR9wdRQcJz4v5bjKwuxMLSx_X';
+// ▲▲▲▲▲ 設定項目 ▲▲▲▲▲
+
+
+/**
+ * メイン処理関数
+ */
+function processPurchaseOrders() {
+  const unprocessedFolder = DriveApp.getFolderById(UNPROCESSED_FOLDER_ID);
+  const processedFolder = DriveApp.getFolderById(PROCESSED_FOLDER_ID);
+  const files = unprocessedFolder.getFiles();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  
+  let processedCount = 0;
+
+  while (files.hasNext()) {
+    const file = files.next();
+    
+    // サポートされているファイル形式のみ処理
+    if (!isSupportedFile(file)) continue;
+
+    try {
+      console.log(`\n処理開始: ${file.getName()}`);
+      const doc = callDocumentAI(file);
+      if (doc) {
+        const commonData = extractCommonData(doc);
+        const lineItems = extractLineItems(doc);
+
+        // 新フィールド対応の品目データをスプレッドシートに追加
+        if (lineItems.length > 0) {
+          lineItems.forEach((item, index) => {
+            if (isValidItem(item)) {
+              const rowData = [
+                // 基本情報（グループエンティティ対応）
+                commonData.scheduled_shipment_date || '',  // 出荷予定日
+                commonData.estimated_arrival_dat || '',   // 到着予定日（typoに対応）
+                commonData.order_source || '',             // 発注元
+                commonData.order_destination || '',        // 発注先
+                commonData.delivery_address || '',         // 配送先
+                commonData.client_reference_id || '',      // 先方記載ID
+                
+                // 品目情報（グループエンティティ対応）
+                item.jan_code_last4 ? "'" + item.jan_code_last4 : '', // JANコード末尾4桁
+                item.product_name || '',                   // 商品名
+                item.quantity || '',                       // 数量
+                item.unit_price || '',                     // 単価
+                item.total_amount || '',                   // 合計金額
+                item.line_number || (index + 1).toString(), // 明細行番号
+                
+                commonData.input_staff || ''               // 入力担当者
+              ];
+              sheet.appendRow(rowData);
+              console.log(`スプレッドシート行追加: 商品=${item.product_name}, 数量=${item.quantity}, JAN=${item.jan_code_last4}`);
+            }
+          });
+        } else {
+          // 品目がない場合も基本情報は記録
+          addBasicInfoRow(sheet, commonData);
+          console.log('基本情報のみ記録');
+        }
+        
+        file.moveTo(processedFolder);
+        processedCount++;
+        console.log(`✓ 処理完了: ${file.getName()}`);
+      } else {
+        console.log(`✗ Document AI処理失敗: ${file.getName()}`);
+      }
+    } catch (e) {
+      console.error(`Error processing ${file.getName()}: ${e.message}`);
+    }
+  }
+  
+  console.log(`\n=== 処理完了 ===`);
+  console.log(`処理ファイル数: ${processedCount}`);
+}
+
+/**
+ * Document AI API呼び出し
+ */
+function callDocumentAI(file) {
+  const endpoint = `https://${LOCATION}-documentai.googleapis.com/v1/projects/${GCP_PROJECT_ID}/locations/${LOCATION}/processors/${PROCESSOR_ID}/processorVersions/${PROCESSOR_VERSION_ID}:process`;
+  
+  const response = UrlFetchApp.fetch(endpoint, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify({
+      skipHumanReview: true,
+      rawDocument: {
+        content: Utilities.base64Encode(file.getBlob().getBytes()),
+        mimeType: file.getMimeType()
+      }
+    }),
+    muteHttpExceptions: true
+  });
+
+  if (response.getResponseCode() === 200) {
+    const result = JSON.parse(response.getContentText());
+    console.log(`Document AI API成功: ${file.getName()}`);
+    return result.document;
+  } else {
+    console.error(`Document AI API失敗: ${response.getResponseCode()}, ${response.getContentText()}`);
+    return null;
+  }
+}
+
+/**
+ * 基本情報抽出（グループエンティティ対応）
+ */
+function extractCommonData(doc) {
+  if (!doc?.entities) return {};
+  
+  const data = {};
+  
+  console.log("=== 基本情報抽出（グループエンティティ対応） ===");
+  
+  // basic_informationとschedule_informationエンティティから抽出
+  doc.entities.forEach(entity => {
+    if (entity.type === 'basic_information' || entity.type === 'schedule_information') {
+      if (entity.properties && entity.properties.length > 0) {
+        entity.properties.forEach(prop => {
+          if (prop.mentionText) {
+            const propType = prop.type;
+            const propText = prop.mentionText.replace(/\n/g, ' ').trim();
+            
+            // 日付系の処理
+            if (propType.includes('date')) {
+              data[propType] = normalizeDate(propText);
+            } else {
+              data[propType] = propText;
+            }
+            
+            console.log(`${propType}: ${data[propType]}`);
+          }
+        });
+      }
+    }
+  });
+  
+  return data;
+}
+
+/**
+ * 品目情報抽出（3段階フォールバック）
+ */
+function extractLineItems(doc) {
+  if (!doc) return [];
+
+  console.log("=== 品目情報抽出開始（3段階フォールバック） ===");
+  
+  // 方法1: line_itemエンティティのネスト構造から抽出
+  const entityResult = extractFromEntities(doc);
+  if (entityResult.length > 0) {
+    console.log(`✓ line_itemネスト抽出成功: ${entityResult.length}個`);
+    return entityResult;
+  }
+  
+  console.log("line_itemネスト抽出失敗、フラット構造を試行...");
+  
+  // 方法2: フラット構造のエンティティから抽出（フォールバック）
+  const flatResult = extractFromFlatEntities(doc);
+  if (flatResult.length > 0) {
+    console.log(`✓ フラット構造抽出成功: ${flatResult.length}個`);
+    return flatResult;
+  }
+  
+  console.log("エンティティ抽出失敗、OCRテキスト抽出を実行...");
+
+  // 方法3: OCRテキストから抽出（最終フォールバック）
+  const ocrResult = extractFromSimpleOCR(doc);
+  console.log(`OCR抽出結果: ${ocrResult.length}個`);
+  return ocrResult;
+}
+
+/**
+ * Document AIエンティティから抽出（グループエンティティ対応）
+ */
+function extractFromEntities(doc) {
+  if (!doc?.entities) return [];
+
+  console.log("=== product_detailsグループでの抽出 ===");
+  
+  const items = [];
+  const productEntities = doc.entities.filter(entity => entity.type === 'product_details');
+  
+  productEntities.forEach((productEntity, index) => {
+    const item = {
+      line_number: (index + 1).toString(),
+      jan_code: '',           // JANコード（フル）
+      jan_code_last4: '',     // JANコード（末尾4桁）
+      product_name: '',       // 商品名
+      quantity: '',           // 数量
+      unit_price: '',         // 単価
+      total_amount: ''        // 合計金額
+    };
+    
+    if (productEntity.properties && productEntity.properties.length > 0) {
+      productEntity.properties.forEach(prop => {
+        if (!prop.mentionText) return;
+        
+        const propType = prop.type;
+        const propText = prop.mentionText.trim();
+
+        // プロパティタイプに基づいて値を設定
+        switch(propType) {
+          case 'jan_code':
+            const code = propText.replace(/[^\d]/g, '');
+            if (code.length >= 4) {
+              item.jan_code = code;
+              item.jan_code_last4 = code.slice(-4);
+              console.log(`  → JANコード設定: ${code} (末尾: ${item.jan_code_last4})`);
+            }
+            break;
+            
+          case 'line_number':
+            item.line_number = propText.replace(/[^\d]/g, '') || (index + 1).toString();
+            console.log(`  → 明細行番号設定: ${item.line_number}`);
+            break;
+            
+          case 'product_name':
+            item.product_name = propText;
+            console.log(`  → 商品名設定: ${propText}`);
+            break;
+            
+          case 'quantity':
+            const qty = propText.replace(/[^\d]/g, '');
+            if (qty && isValidQuantity(parseInt(qty))) {
+              item.quantity = qty;
+              console.log(`  → 数量設定: ${qty}`);
+            }
+            break;
+            
+          case 'unit_price':
+            const price = propText.replace(/[^\d.]/g, '');
+            if (price) {
+              item.unit_price = price;
+              console.log(`  → 単価設定: ${price}`);
+            }
+            break;
+            
+          case 'total_amount':
+            // カンマや文字を除去して数値のみ抽出
+            const amount = propText.replace(/[^\d,]/g, '').replace(/,/g, '');
+            if (amount) {
+              item.total_amount = amount;
+              console.log(`  → 合計金額設定: ${amount}`);
+            }
+            break;
+        }
+      });
+    }
+    
+    // 数量またはJANコードがあるアイテムのみ追加
+    if (item.quantity || item.jan_code) {
+      items.push(item);
+      console.log(`  ✓ アイテム追加: ${JSON.stringify(item)}`);
+    }
+  });
+  
+  return items;
+}
+
+/**
+ * フラット構造のエンティティから抽出（新フィールド対応フォールバック用）
+ */
+function extractFromFlatEntities(doc) {
+  if (!doc?.entities) return [];
+
+  console.log("=== フラット構造での抽出（新フィールド対応フォールバック） ===");
+  
+  // 各フィールドタイプ別に配列で収集
+  const quantities = [];
+  const janCodes = [];
+  const productNames = [];
+  const lineNumbers = [];
+  const unitPrices = [];
+  const totalAmounts = [];
+
+  doc.entities.forEach(entity => {
+    if (!entity.mentionText || entity.type === 'line_item') return;
+    
+    const entityType = entity.type || '';
+    const entityText = entity.mentionText.trim();
+
+    // 新しいフィールド構成に対応
+    switch(entityType) {
+      case 'quantity':
+        const qty = entityText.replace(/[^\d]/g, '');
+        if (qty && isValidQuantity(parseInt(qty))) {
+          quantities.push(qty);
+          console.log(`  → 数量として追加: ${qty}`);
+        }
+        break;
+        
+      case 'jan_code':
+        const code = entityText.replace(/[^\d]/g, '');
+        if (code.length >= 4) {
+          janCodes.push(code);
+          console.log(`  → JANコードとして追加: ${code}`);
+        }
+        break;
+        
+      case 'product_name':
+        if (entityText) {
+          productNames.push(entityText);
+          console.log(`  → 商品名として追加: ${entityText}`);
+        }
+        break;
+        
+      case 'line_number':
+        const lineNum = entityText.replace(/[^\d]/g, '');
+        if (lineNum) {
+          lineNumbers.push(lineNum);
+          console.log(`  → 明細行番号として追加: ${lineNum}`);
+        }
+        break;
+        
+      case 'unit_price':
+        const price = entityText.replace(/[^\d]/g, '');
+        if (price) {
+          unitPrices.push(price);
+          console.log(`  → 単価として追加: ${price}`);
+        }
+        break;
+        
+      case 'total_amount':
+        const amount = entityText.replace(/[^\d]/g, '');
+        if (amount) {
+          totalAmounts.push(amount);
+          console.log(`  → 合計金額として追加: ${amount}`);
+        }
+        break;
+    }
+  });
+
+  // 最も多く抽出された項目数に基づいてアイテムを構築
+  const maxItems = Math.max(
+    quantities.length, 
+    janCodes.length, 
+    productNames.length, 
+    lineNumbers.length,
+    unitPrices.length,
+    totalAmounts.length
+  );
+  
+  const items = [];
+  
+  for (let i = 0; i < maxItems; i++) {
+    const item = {
+      line_number: lineNumbers[i] || (i + 1).toString(),
+      jan_code: janCodes[i] || '',
+      jan_code_last4: janCodes[i] ? janCodes[i].slice(-4) : '',
+      product_name: productNames[i] || '',
+      quantity: quantities[i] || '',
+      unit_price: unitPrices[i] || '',
+      total_amount: totalAmounts[i] || ''
+    };
+    
+    // 数量またはJANコードがあるアイテムのみ追加
+    if (item.quantity || item.jan_code) {
+      items.push(item);
+    }
+  }
+
+  console.log(`フラット構造抽出結果: ${items.length}個のアイテム`);
+  return items;
+}
+
+/**
+ * シンプルなOCRテキスト抽出（最終フォールバック）
+ */
+function extractFromSimpleOCR(doc) {
+  if (!doc?.text) return [];
+
+  console.log("=== シンプルOCR抽出（最終フォールバック） ===");
+  
+  const janCodes = doc.text.match(/4\d{12}/g) || [];
+  console.log(`JANコード検出: ${janCodes.length}個`);
+  
+  const items = [];
+  
+  janCodes.forEach((janCode, index) => {
+    let quantity = findQuantityForJAN(doc.text, janCode, index);
+    
+    if (quantity) {
+      items.push({
+        line_number: (index + 1).toString(),
+        jan_code: janCode,
+        jan_code_last4: janCode.slice(-4),
+        product_name: '',
+        quantity: quantity,
+        unit_price: '',
+        total_amount: ''
+      });
+      console.log(`JAN ${janCode.slice(-4)}: 数量="${quantity}"`);
+    }
+  });
+
+  return items;
+}
+
+/**
+ * 特定のJANコードに対する数量を見つける
+ */
+function findQuantityForJAN(text, janCode, janIndex) {
+  const lines = text.split('\n');
+  
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes(janCode)) {
+      const line = lines[i].trim();
+      
+      let match = line.match(/\s(\d)\s*$/);
+      if (match) return match[1];
+      
+      match = line.match(/J\d+\s+(\d+)/);
+      if (match && parseInt(match[1]) >= 1 && parseInt(match[1]) <= 99) {
+        return match[1];
+      }
+      
+      const numbers = line.match(/\b(\d{1,2})\b/g);
+      if (numbers) {
+        for (let j = numbers.length - 1; j >= 0; j--) {
+          const num = parseInt(numbers[j]);
+          if (num >= 1 && num <= 99) return numbers[j];
+        }
+      }
+    }
+  }
+  
+  return '';
+}
+
+/**
+ * 日付正規化
+ */
+function normalizeDate(dateStr) {
+  if (!dateStr) return '';
+  
+  const jpMatch = dateStr.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+  if (jpMatch) {
+    const [, year, month, day] = jpMatch;
+    return `${year}/${month.padStart(2, '0')}/${day.padStart(2, '0')}`;
+  }
+  
+  const slashMatch = dateStr.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (slashMatch) {
+    const [, year, month, day] = slashMatch;
+    return `${year}/${month.padStart(2, '0')}/${day.padStart(2, '0')}`;
+  }
+  
+  return dateStr;
+}
+
+/**
+ * ヘルパー関数群
+ */
+function isSupportedFile(file) {
+  const mimeType = file.getMimeType();
+  return mimeType === MimeType.PDF || 
+         mimeType === MimeType.JPEG || 
+         mimeType === MimeType.PNG;
+}
+
+function isValidItem(item) {
+  return (item.quantity && item.quantity !== '0') || item.jan_code;
+}
+
+function addBasicInfoRow(sheet, commonData) {
+  const rowData = [
+    commonData.scheduled_shipment_date || '',
+    commonData.estimated_arrival_dat || '',    // typoに対応
+    commonData.order_source || '',
+    commonData.order_destination || '',
+    commonData.delivery_address || '',
+    commonData.client_reference_id || '',
+    '', '', '', '', '', '1', // 品目情報部分は空
+    commonData.input_staff || ''
+  ];
+  sheet.appendRow(rowData);
+}
+
+function isValidQuantity(num) {
+  return num >= 1 && num <= 999;
+}
+
+/**
+ * スプレッドシートメニュー
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Document AI 連携')
+    .addItem('発注書処理', 'processPurchaseOrders')
+    .addToUi();
+}
